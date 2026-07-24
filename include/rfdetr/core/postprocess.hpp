@@ -21,10 +21,17 @@ struct PostprocessParams {
 };
 
 // Map raw class id (0..num_classes_with_bg-1) to dense user-facing class id
-// (0..num_classes-1). Shifts down by one when background filtering is enabled,
-// so callers never see the no-object slot.
+// (0..num_classes-1), so callers never see the no-object slot. Only shifts
+// indices that sit *after* the no-object slot -- correct regardless of
+// whether it's first (bg_class_index==0, e.g. some legacy/COCO-pretrained
+// checkpoints) or last (bg_class_index==num_classes_with_bg-1, RF-DETR's
+// actual architecture: the class head always appends a +1 no-object slot at
+// the end -- see rfdetr's own criterion.py and its ONNX reference decoder,
+// which universally drops the *last* logit column). The previous unconditional
+// `raw_class - 1` only handled the background-first case.
 inline int dense_class_from_raw(int raw_class, int bg_class_index) noexcept {
-    return (bg_class_index >= 0) ? (raw_class - 1) : raw_class;
+    if (bg_class_index < 0) return raw_class;
+    return (raw_class < bg_class_index) ? raw_class : raw_class - 1;
 }
 
 // Decode RF-DETR detection outputs (CPU implementation).

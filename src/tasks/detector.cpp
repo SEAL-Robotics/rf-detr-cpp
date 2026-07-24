@@ -92,7 +92,15 @@ struct RFDetrDetector::Impl {
         pp.num_classes_with_bg = C;
         pp.topk                = N;
         pp.threshold           = opts.threshold;
-        pp.bg_class_index      = 0;
+        // RF-DETR's class head always appends a +1 no-object slot at the END
+        // (see rfdetr's own criterion.py and its ONNX reference decoder, which
+        // universally drops the *last* logit column) -- confirmed empirically
+        // against a fine-tuned checkpoint for this deployment. The upstream
+        // default of 0 (background-first) may still be correct for the
+        // official pretrained COCO checkpoints specifically (unverified here,
+        // out of scope for this project, which only ever deploys fine-tuned
+        // checkpoints) -- flag before upstreaming this change.
+        pp.bg_class_index      = C - 1;
 
         // Attempt CUDA Graph capture if requested.
         if (opts.use_cuda_graph) {
