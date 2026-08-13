@@ -38,13 +38,27 @@ find_package(CUDAToolkit REQUIRED)
 find_package(TensorRT REQUIRED)
 find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs videoio highgui)
 
-include(FetchContent)
-FetchContent_Declare(json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.3
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(json)
+# Prefer the system package (Ubuntu/Debian: nlohmann-json3-dev, exports a
+# proper nlohmann_jsonConfig.cmake) over fetching from GitHub at configure
+# time -- SEAL fork addition. Upstream always FetchContent'd unconditionally,
+# which needs network access on every from-scratch configure and is a real
+# problem on an air-gapped/offline build host (e.g. a Jetson with no
+# internet). Only falls back to FetchContent if the system package is
+# genuinely absent, so this stays a no-op improvement, not a hard new
+# dependency.
+find_package(nlohmann_json 3.11 QUIET)
+if(NOT nlohmann_json_FOUND)
+    message(STATUS "System nlohmann_json>=3.11 not found -- fetching v3.11.3 from GitHub")
+    include(FetchContent)
+    FetchContent_Declare(json
+        GIT_REPOSITORY https://github.com/nlohmann/json.git
+        GIT_TAG v3.11.3
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(json)
+else()
+    message(STATUS "Using system nlohmann_json ${nlohmann_json_VERSION}")
+endif()
 
 # ------------------------------------------------------------------------------
 # Library target
