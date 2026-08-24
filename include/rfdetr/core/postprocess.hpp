@@ -3,6 +3,7 @@
 #include "rfdetr/core/types.hpp"
 
 #include <cstddef>
+#include <vector>
 
 namespace rfdetr {
 
@@ -18,6 +19,29 @@ struct PostprocessParams {
     int   topk{300};              // num_select; default = num_queries (Python reference)
     float threshold{0.5f};        // score threshold
     int   bg_class_index{kCocoBackgroundIndex};  // raw class id treated as bg; -1 disables filtering
+
+    // --- hierarchical (parent/fine) decode -----------------------------------
+    // Set from the engine meta sidecar's `parent_class_index` /
+    // `fine_class_indices` / `fine_conf_threshold` (schema_version >= 2).
+    //
+    // When parent_class_index < 0 (the default) decoding is unchanged: rank every
+    // (query, class) pair by its own logit, exactly as before.
+    //
+    // When it is >= 0 the model was trained with a PARENT class that is positive
+    // for every instance plus FINE classes that are supervised only where the
+    // distinction exists (pin_any vs pin_up/pin_down; see the pin_detector repo's
+    // CLAUDE.md). The columns are independent sigmoids, NOT a softmax, so one
+    // query legitimately scores high on the parent AND on a fine class -- and the
+    // old all-pairs ranking therefore emits TWO detections for one physical
+    // object, with different class ids. Hierarchical decoding instead ranks
+    // queries by the parent column alone and reports the fine class as an
+    // attribute of that single detection, falling back to the parent id when
+    // neither fine column is confident. That fallback is meaningful, not a
+    // failure: it is an explicit "object detected, sub-state unclear", which is
+    // the honest output on input the fine classifier was never trained for.
+    int   parent_class_index{-1};       // raw class id of the parent; <0 = flat decode
+    std::vector<int> fine_class_indices;// raw class ids of the fine classes
+    float fine_conf_threshold{0.0f};    // fine sigmoid must reach this to be reported
 };
 
 // Map raw class id (0..num_classes_with_bg-1) to dense user-facing class id

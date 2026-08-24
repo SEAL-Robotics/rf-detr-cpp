@@ -24,6 +24,10 @@ EngineMeta EngineMeta::from_json_file(const std::filesystem::path& path) {
     m.input_w     = j.value("input_w", 0);
     m.num_queries = j.value("num_queries", 0);
     m.num_classes = j.value("num_classes", 0);
+    m.parent_class_index   = j.value("parent_class_index", -1);
+    m.fine_class_indices   = j.value("fine_class_indices", std::vector<int>{});
+    m.fine_conf_threshold  = j.value("fine_conf_threshold", 0.0f);
+    m.class_names          = j.value("class_names", std::vector<std::string>{});
 
     if (j.contains("mean") && j["mean"].is_array() && j["mean"].size() == 3) {
         m.mean = j["mean"].get<std::array<float, 3>>();
@@ -67,6 +71,10 @@ void EngineMeta::to_json_file(const std::filesystem::path& path) const {
         {"has_masks", has_masks},
         {"mask_h", mask_h},
         {"mask_w", mask_w},
+        {"parent_class_index", parent_class_index},
+        {"fine_class_indices", fine_class_indices},
+        {"fine_conf_threshold", fine_conf_threshold},
+        {"class_names", class_names},
     };
     std::ofstream out(path);
     if (!out) {

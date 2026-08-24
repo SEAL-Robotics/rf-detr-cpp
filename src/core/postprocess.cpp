@@ -42,15 +42,43 @@ void decode_impl(const float* dets, const float* labels, int img_w, int img_h,
     }
     const int N = p.num_queries;
     const int C = p.num_classes_with_bg;
-    const int total = N * C;
+    const bool hierarchical = p.parent_class_index >= 0 && p.parent_class_index < C;
+    // Flat decode ranks every (query, class) pair; hierarchical decode ranks each
+    // query exactly once, by its parent logit.
+    const int total = hierarchical ? N : N * C;
     const int K = std::min(p.topk > 0 ? p.topk : N, total);
 
     std::vector<Candidate> cand;
     cand.reserve(static_cast<std::size_t>(total));
-    for (int q = 0; q < N; ++q) {
-        const float* lq = labels + q * C;
-        for (int c = 0; c < C; ++c) {
-            cand.push_back({lq[c], q, c});
+    if (hierarchical) {
+        for (int q = 0; q < N; ++q) {
+            const float* lq = labels + q * C;
+            // raw_class carries the fine class when one is confident, else the
+            // parent -- resolved here so the shared loop below is untouched. The
+            // ranking score stays the PARENT logit either way, so a confident fine
+            // class never inflates or deflates the detection confidence; it only
+            // labels it.
+            int   best_fine = -1;
+            float best_fine_logit = 0.0f;
+            for (const int fc : p.fine_class_indices) {
+                if (fc < 0 || fc >= C) continue;
+                if (best_fine < 0 || lq[fc] > best_fine_logit) {
+                    best_fine = fc;
+                    best_fine_logit = lq[fc];
+                }
+            }
+            const int chosen =
+                (best_fine >= 0 && sigmoid(best_fine_logit) >= p.fine_conf_threshold)
+                    ? best_fine
+                    : p.parent_class_index;
+            cand.push_back({lq[p.parent_class_index], q, chosen});
+        }
+    } else {
+        for (int q = 0; q < N; ++q) {
+            const float* lq = labels + q * C;
+            for (int c = 0; c < C; ++c) {
+                cand.push_back({lq[c], q, c});
+            }
         }
     }
 

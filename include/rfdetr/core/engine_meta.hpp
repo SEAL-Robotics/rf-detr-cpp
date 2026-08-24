@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <vector>
 #include <filesystem>
 #include <string>
 
@@ -33,6 +34,17 @@ struct EngineMeta {
     bool has_masks{false};
     int  mask_h{0};
     int  mask_w{0};
+
+    // Hierarchical parent/fine class scheme (schema_version >= 2). Defaults keep
+    // flat behaviour, so a v1 sidecar decodes exactly as before -- the parser uses
+    // j.value(key, default) throughout and never rejects unknown keys, so old and
+    // new sidecars are mutually compatible in both directions.
+    // parent_class_index < 0 means "no hierarchy"; see PostprocessParams in
+    // core/postprocess.hpp for what the decode then does.
+    int parent_class_index{-1};
+    std::vector<int> fine_class_indices;
+    float fine_conf_threshold{0.0f};
+    std::vector<std::string> class_names;
 
     static EngineMeta from_json_file(const std::filesystem::path& path);
     void to_json_file(const std::filesystem::path& path) const;

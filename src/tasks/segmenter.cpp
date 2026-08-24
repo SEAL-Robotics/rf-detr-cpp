@@ -133,6 +133,14 @@ struct RFDetrSegmenter::Impl {
         // See detector.cpp's Impl ctor for why this is C - 1, not 0.
         pp.bg_class_index      = C - 1;
 
+        // Hierarchical parent/fine decode, driven entirely by the sidecar. A v1
+        // sidecar (or any engine built before the hierarchical scheme) leaves
+        // parent_class_index at -1 and decoding stays flat, so this is
+        // backward-compatible without a version check.
+        pp.parent_class_index  = meta.parent_class_index;
+        pp.fine_class_indices  = meta.fine_class_indices;
+        pp.fine_conf_threshold = meta.fine_conf_threshold;
+
         if (opts.use_cuda_graph) {
             if (!meta.cuda_graph_compat) {
                 log_message(LogSeverity::kWarning,
