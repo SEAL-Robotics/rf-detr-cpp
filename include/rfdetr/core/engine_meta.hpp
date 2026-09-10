@@ -3,6 +3,7 @@
 #include <array>
 #include <vector>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace rfdetr {
@@ -45,6 +46,29 @@ struct EngineMeta {
     std::vector<int> fine_class_indices;
     float fine_conf_threshold{0.0f};
     std::vector<std::string> class_names;
+
+    // Monochrome input contract (schema_version >= 4). Nothing here changes
+    // preprocessing or the engine: a mono-trained RF-DETR still takes the same
+    // (1,3,H,W) input, each of the three channels carrying the same replicated
+    // luma. It exists because that makes a mono-trained and a colour-trained
+    // engine structurally indistinguishable -- same input shape, same outputs --
+    // so feeding one the wrong kind of frame raises no error anywhere, it just
+    // degrades detections quietly. This is the only thing a consumer can check
+    // the incoming stream against.
+    //
+    // std::optional, not bool, because "key absent" (every sidecar written
+    // before schema 4) has to stay distinguishable from an explicit false.
+    // Defaulting to false would relabel every legacy engine as colour-trained,
+    // which is a claim this reader has no evidence for and which a consumer
+    // would then act on.
+    std::optional<bool> input_monochrome;
+
+    // RGB->luma coefficients the training-time export used; only meaningful
+    // when input_monochrome is true. Default is BT.601, which is also what
+    // OpenCV's COLOR_BGR2GRAY hardcodes -- so a consumer forced to convert
+    // colour frames itself reproduces the training transform instead of a
+    // near-miss.
+    std::array<float, 3> luma_weights{0.299f, 0.587f, 0.114f};
 
     static EngineMeta from_json_file(const std::filesystem::path& path);
     void to_json_file(const std::filesystem::path& path) const;

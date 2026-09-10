@@ -29,6 +29,18 @@ EngineMeta EngineMeta::from_json_file(const std::filesystem::path& path) {
     m.fine_conf_threshold  = j.value("fine_conf_threshold", 0.0f);
     m.class_names          = j.value("class_names", std::vector<std::string>{});
 
+    // Presence, not schema_version, is the signal: the exporter has bumped the
+    // version for reasons unrelated to this field before, and a hand-edited or
+    // partially-migrated sidecar should still be read for what it actually
+    // says. Absent stays absent -- see EngineMeta::input_monochrome.
+    if (j.contains("input_monochrome") && j["input_monochrome"].is_boolean()) {
+        m.input_monochrome = j["input_monochrome"].get<bool>();
+    }
+    if (j.contains("luma_weights") && j["luma_weights"].is_array() &&
+        j["luma_weights"].size() == 3) {
+        m.luma_weights = j["luma_weights"].get<std::array<float, 3>>();
+    }
+
     if (j.contains("mean") && j["mean"].is_array() && j["mean"].size() == 3) {
         m.mean = j["mean"].get<std::array<float, 3>>();
     }
@@ -76,6 +88,20 @@ void EngineMeta::to_json_file(const std::filesystem::path& path) const {
         {"fine_conf_threshold", fine_conf_threshold},
         {"class_names", class_names},
     };
+
+    // Emitted only when actually known. rfdetr_build reads a sidecar into this
+    // struct and writes it back out, so anything not represented here is
+    // dropped on the way from the exported ONNX meta to the engine meta the
+    // runtime loads -- which is exactly why these two live in EngineMeta and
+    // not only in the exporter. Writing `false` for an absent key would turn
+    // "unknown" into a positive claim of colour training during that copy.
+    if (input_monochrome.has_value()) {
+        j["input_monochrome"] = *input_monochrome;
+        if (*input_monochrome) {
+            j["luma_weights"] = luma_weights;
+        }
+    }
+
     std::ofstream out(path);
     if (!out) {
         throw std::runtime_error("rfdetr: cannot write meta sidecar: " + path.string());
