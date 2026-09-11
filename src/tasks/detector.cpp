@@ -6,6 +6,7 @@
 #include "rfdetr/core/postprocess.hpp"
 #include "../internal/cuda_check.hpp"
 #include "../internal/cuda_preprocess.cuh"
+#include "../internal/meta_validate.hpp"
 #include "../internal/trt_session.hpp"
 
 #include <NvInferRuntime.h>
@@ -66,6 +67,11 @@ struct RFDetrDetector::Impl {
         if (meta.input_h != meta.input_w) {
             throw std::runtime_error("rfdetr: non-square input not supported");
         }
+        // The sidecar is otherwise trusted absolutely: it sizes preprocessing,
+        // while the device buffer preprocessing writes into is sized from the
+        // engine. See require_meta_matches_engine for why a disagreement between
+        // the two is silent in both directions.
+        require_meta_matches_engine(session, meta, "RFDetrDetector");
 
         preprocessor = std::make_unique<ImagePreprocessor>(
             meta.input_h, /*bgr_to_rgb=*/meta.color_order == "RGB");
@@ -100,7 +106,10 @@ struct RFDetrDetector::Impl {
         // official pretrained COCO checkpoints specifically (unverified here,
         // out of scope for this project, which only ever deploys fine-tuned
         // checkpoints) -- flag before upstreaming this change.
-        pp.bg_class_index      = C - 1;
+        //
+        // A schema-4 sidecar states the same index outright; when it does, the
+        // two must agree. See resolve_bg_class_index.
+        pp.bg_class_index      = resolve_bg_class_index(meta, C, "RFDetrDetector");
 
         // Hierarchical parent/fine decode, driven entirely by the sidecar. A v1
         // sidecar (or any engine built before the hierarchical scheme) leaves

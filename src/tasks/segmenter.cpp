@@ -7,6 +7,7 @@
 #include "../internal/cuda_check.hpp"
 #include "../internal/cuda_preprocess.cuh"
 #include "../internal/mask_decode.cuh"
+#include "../internal/meta_validate.hpp"
 #include "../internal/trt_session.hpp"
 
 #include <NvInferRuntime.h>
@@ -71,6 +72,11 @@ struct RFDetrSegmenter::Impl {
         if (meta.input_h != meta.input_w) {
             throw std::runtime_error("rfdetr: non-square input not supported");
         }
+        // The sidecar is otherwise trusted absolutely: it sizes preprocessing,
+        // while the device buffer preprocessing writes into is sized from the
+        // engine. See require_meta_matches_engine for why a disagreement between
+        // the two is silent in both directions.
+        require_meta_matches_engine(session, meta, "RFDetrSegmenter");
 
         preprocessor = std::make_unique<ImagePreprocessor>(
             meta.input_h, /*bgr_to_rgb=*/meta.color_order == "RGB");
@@ -130,8 +136,9 @@ struct RFDetrSegmenter::Impl {
         pp.num_classes_with_bg = C;
         pp.topk                = N;
         pp.threshold           = opts.threshold;
-        // See detector.cpp's Impl ctor for why this is C - 1, not 0.
-        pp.bg_class_index      = C - 1;
+        // See detector.cpp's Impl ctor for why this is C - 1, not 0, and
+        // resolve_bg_class_index for the sidecar cross-check.
+        pp.bg_class_index      = resolve_bg_class_index(meta, C, "RFDetrSegmenter");
 
         // Hierarchical parent/fine decode, driven entirely by the sidecar. A v1
         // sidecar (or any engine built before the hierarchical scheme) leaves

@@ -4,6 +4,7 @@
 
 #include <fstream>
 #include <stdexcept>
+#include <string>
 
 namespace rfdetr {
 
@@ -39,6 +40,33 @@ EngineMeta EngineMeta::from_json_file(const std::filesystem::path& path) {
     if (j.contains("luma_weights") && j["luma_weights"].is_array() &&
         j["luma_weights"].size() == 3) {
         m.luma_weights = j["luma_weights"].get<std::array<float, 3>>();
+    }
+
+    // Same "absent stays absent" treatment, for the same reason: the tasks
+    // cross-check this against their own C-1 derivation and can only do that
+    // when the sidecar genuinely stated a value.
+    if (j.contains("bg_class_index") && j["bg_class_index"].is_number_integer()) {
+        m.bg_class_index = j["bg_class_index"].get<int>();
+    }
+
+    // Pass-through only -- nothing here decodes pin types yet. Every one of
+    // these is type-checked rather than read with j.value(): the exporter
+    // writes an explicit JSON `null` for pin_type_output_name (and for
+    // luma_weights) whenever the field does not apply, and nlohmann's
+    // value(key, default) THROWS type_error.302 on a null rather than falling
+    // back to the default. A plain j.value() here would make every sidecar from
+    // a model without a pin-type head -- i.e. the current one -- fail to load.
+    m.has_pin_types = j.contains("has_pin_types") && j["has_pin_types"].is_boolean()
+                          ? j["has_pin_types"].get<bool>()
+                          : false;
+    if (j.contains("pin_type_output_name") && j["pin_type_output_name"].is_string()) {
+        m.pin_type_output_name = j["pin_type_output_name"].get<std::string>();
+    }
+    if (j.contains("pin_type_names") && j["pin_type_names"].is_array()) {
+        m.pin_type_names = j["pin_type_names"].get<std::vector<std::string>>();
+    }
+    if (j.contains("num_pin_types") && j["num_pin_types"].is_number_integer()) {
+        m.num_pin_types = j["num_pin_types"].get<int>();
     }
 
     if (j.contains("mean") && j["mean"].is_array() && j["mean"].size() == 3) {
@@ -87,6 +115,17 @@ void EngineMeta::to_json_file(const std::filesystem::path& path) const {
         {"fine_class_indices", fine_class_indices},
         {"fine_conf_threshold", fine_conf_threshold},
         {"class_names", class_names},
+        // Unconditional, unlike the two optionals below: `false` / `[]` / `0` is
+        // the exporter's own canonical spelling of "this model has no pin-type
+        // head", not a guess, and a consumer treats an absent key identically.
+        // null (not "") for the output name mirrors the exporter exactly, and
+        // from_json_file reads it back as the empty string, so the round trip is
+        // stable in both directions.
+        {"has_pin_types", has_pin_types},
+        {"pin_type_output_name",
+         pin_type_output_name.empty() ? json(nullptr) : json(pin_type_output_name)},
+        {"pin_type_names", pin_type_names},
+        {"num_pin_types", num_pin_types},
     };
 
     // Emitted only when actually known. rfdetr_build reads a sidecar into this
@@ -101,12 +140,28 @@ void EngineMeta::to_json_file(const std::filesystem::path& path) const {
             j["luma_weights"] = luma_weights;
         }
     }
+    // Likewise: an absent bg_class_index leaves the tasks on their C-1
+    // derivation, whereas an invented one would be cross-checked against that
+    // derivation and could only ever agree with it -- a check that proves
+    // nothing.
+    if (bg_class_index.has_value()) {
+        j["bg_class_index"] = *bg_class_index;
+    }
 
     std::ofstream out(path);
     if (!out) {
         throw std::runtime_error("rfdetr: cannot write meta sidecar: " + path.string());
     }
     out << j.dump(2) << '\n';
+}
+
+std::optional<std::string> describe_input_resolution_mismatch(const EngineMeta& meta,
+                                                              int engine_h, int engine_w) {
+    if (engine_h <= 0 || engine_w <= 0) return std::nullopt;  // dynamic, unresolved
+    if (meta.input_h == engine_h && meta.input_w == engine_w) return std::nullopt;
+    return "meta sidecar declares input " + std::to_string(meta.input_h) + "x" +
+           std::to_string(meta.input_w) + " but the engine's input binding is " +
+           std::to_string(engine_h) + "x" + std::to_string(engine_w);
 }
 
 }  // namespace rfdetr

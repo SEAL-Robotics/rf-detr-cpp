@@ -138,7 +138,15 @@ int main(int argc, char** argv) {
         pp.num_classes_with_bg  = C;
         pp.topk                 = N;
         pp.threshold            = args.threshold;
-        pp.bg_class_index       = 0;
+        // Background is the LAST logit column for a fine-tuned RF-DETR, not the
+        // first -- the class head is always num_classes + 1 wide and the extra
+        // slot is appended. Hardcoding 0 here (background-first, the COCO
+        // assumption) made this tool disagree with RFDetrDetector and
+        // RFDetrSegmenter, which both use C - 1: pointed at a fine-tuned engine
+        // it would drop every detection of class 0 as "background" and emit the
+        // real no-object rows as detections. Prefer the sidecar's explicit
+        // value, falling back to the same derivation the library uses.
+        pp.bg_class_index       = meta.bg_class_index.value_or(C - 1);
 
         // Warm-up.
         prep.process(image, d_input, sess.stream());

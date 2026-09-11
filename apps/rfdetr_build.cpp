@@ -237,6 +237,7 @@ int main(int argc, char** argv) {
     rfdetr::TrtLogger logger{args.verbose ? nvinfer1::ILogger::Severity::kVERBOSE
                                           : nvinfer1::ILogger::Severity::kWARNING};
 
+    std::printf("[rfdetr_build] rfdetr lib  : v%s\n", rfdetr::version());
     std::printf("[rfdetr_build] onnx        : %s\n", args.onnx.c_str());
     std::printf("[rfdetr_build] engine out  : %s\n", args.engine.c_str());
     std::printf("[rfdetr_build] precision   : %s\n", args.precision.c_str());
@@ -419,8 +420,19 @@ int main(int argc, char** argv) {
             meta.color_order = "RGB";
         }
         if (in_dims.nbDims == 4) {
-            if (in_dims.d[2] > 0) meta.input_h = in_dims.d[2];
-            if (in_dims.d[3] > 0) meta.input_w = in_dims.d[3];
+            // The ONNX graph outranks the sidecar here -- it is what the engine was
+            // actually built from. Say so out loud when they differ: this overwrite
+            // is the one thing that quietly repairs a wrong exporter-side resolution,
+            // and a silent repair means nobody ever learns the exporter is wrong.
+            const int onnx_h = (in_dims.d[2] > 0) ? static_cast<int>(in_dims.d[2]) : meta.input_h;
+            const int onnx_w = (in_dims.d[3] > 0) ? static_cast<int>(in_dims.d[3]) : meta.input_w;
+            if (have_meta && (onnx_h != meta.input_h || onnx_w != meta.input_w)) {
+                std::printf("[rfdetr_build] WARNING: meta sidecar said %dx%d, ONNX graph says "
+                            "%dx%d — writing the ONNX value. Check the exporter.\n",
+                            meta.input_h, meta.input_w, onnx_h, onnx_w);
+            }
+            meta.input_h = onnx_h;
+            meta.input_w = onnx_w;
         }
         // If the ONNX was pre-converted to FP16 or INT8-QDQ but the builder flag
         // is fp32 (TRT 11 strongly-typed path), preserve the sidecar precision so
@@ -437,6 +449,26 @@ int main(int argc, char** argv) {
 
         meta.to_json_file(args.meta_out);
         std::printf("[rfdetr_build] wrote %s\n", args.meta_out.c_str());
+        // The engine sidecar is the ROS node's only description of this engine, and
+        // rfdetr_build is a lossy copy of the exporter's sidecar by construction --
+        // anything EngineMeta does not model is dropped here. Print what survived so
+        // a missing field is visible at build time rather than at deploy time.
+        std::printf("[rfdetr_build] meta out    : schema v%d, variant=%s, %dx%d, "
+                    "queries=%d, classes=%d, precision=%s\n",
+                    meta.schema_version, meta.variant.c_str(), meta.input_h, meta.input_w,
+                    meta.num_queries, meta.num_classes, meta.precision.c_str());
+        const std::string bg_str = meta.bg_class_index ? std::to_string(*meta.bg_class_index)
+                                                       : std::string("(absent)");
+        std::printf("[rfdetr_build]               bg_class_index=%s, parent_class_index=%d, "
+                    "fine_classes=%zu, class_names=%zu\n",
+                    bg_str.c_str(), meta.parent_class_index, meta.fine_class_indices.size(),
+                    meta.class_names.size());
+        std::printf("[rfdetr_build]               has_masks=%s (%dx%d), has_pin_types=%s (%d), "
+                    "input_monochrome=%s\n",
+                    meta.has_masks ? "true" : "false", meta.mask_h, meta.mask_w,
+                    meta.has_pin_types ? "true" : "false", meta.num_pin_types,
+                    meta.input_monochrome ? (*meta.input_monochrome ? "true" : "false")
+                                          : "(absent)");
 
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
