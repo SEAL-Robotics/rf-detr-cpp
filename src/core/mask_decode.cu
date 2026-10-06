@@ -7,6 +7,7 @@
 #include <cuda_runtime_api.h>
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 #include <vector>
@@ -65,8 +66,15 @@ __global__ void maskDecodeKernel(const float*         __restrict__ d_logits,
 
 }  // namespace
 
-// Grow-only staging buffers. Reallocation is rare after the first few frames,
-// so the steady-state cost of a decode is the copies and the kernel alone.
+// cudaMalloc/cudaMallocHost synchronise the whole device, stalling every other
+// segmenter's stream in the process, so a decode must not allocate. The logits
+// and indices are sized at construction from the engine's bindings. Masks are
+// decoded in chunks of kMaskChunk detections through one chunk-sized buffer, so
+// its size depends on the frame resolution alone, never on how many detections
+// a frame has: it is allocated on the first decode at a resolution, and a
+// fixed-resolution camera never allocates again.
+constexpr std::size_t kMaskChunk = 16;
+
 struct MaskDecodeScratch {
     HostPtr h_logits, h_idx, h_masks;
     DevPtr  d_logits, d_idx, d_masks;
@@ -107,6 +115,16 @@ MaskDecodeScratchPtr make_mask_decode_scratch() {
     return MaskDecodeScratchPtr(new MaskDecodeScratch());
 }
 
+MaskDecodeScratchPtr make_mask_decode_scratch(int num_queries, int mH, int mW) {
+    MaskDecodeScratchPtr p(new MaskDecodeScratch());
+    const std::size_t q = static_cast<std::size_t>(num_queries > 0 ? num_queries : 0);
+    p->reserve(q * static_cast<std::size_t>(mH) * static_cast<std::size_t>(mW) * sizeof(float),
+               kMaskChunk * sizeof(std::int32_t), 0);
+    return p;
+}
+
+std::size_t mask_decode_chunk() noexcept { return kMaskChunk; }
+
 void gpu_decode_masks(const float*            h_masks_logits,
                       const std::vector<int>& query_indices,
                       int mH, int mW,
@@ -114,13 +132,13 @@ void gpu_decode_masks(const float*            h_masks_logits,
                       Detections&             detections,
                       MaskDecodeScratch*      scratch,
                       void*                   cuda_stream) {
-    const int num_dets = static_cast<int>(detections.size());
+    const std::size_t num_dets = detections.size();
     if (num_dets == 0 || !h_masks_logits) return;
     if (mH <= 0 || mW <= 0 || imgH <= 0 || imgW <= 0) return;
     // The index-staging loop below walks num_dets entries; a short vector would
     // read out of range. Callers reaching this directly skip decode_masks()'
     // checks, so validate here too.
-    if (query_indices.size() != detections.size()) return;
+    if (query_indices.size() != num_dets) return;
 
     auto stream = static_cast<cudaStream_t>(cuda_stream);
 
@@ -131,57 +149,58 @@ void gpu_decode_masks(const float*            h_masks_logits,
 
     const std::size_t logit_bytes = num_q_needed *
                                     static_cast<std::size_t>(mH) * mW * sizeof(float);
-    const std::size_t idx_bytes   = static_cast<std::size_t>(num_dets) * sizeof(std::int32_t);
     const std::size_t mask_plane  = static_cast<std::size_t>(imgH) * imgW;
-    const std::size_t mask_bytes  = static_cast<std::size_t>(num_dets) * mask_plane;
 
     // Reuse the caller's staging when provided; otherwise fall back to a
-    // call-scoped scratch so the standalone entry point keeps working.
+    // call-scoped scratch so the standalone entry point keeps working. A
+    // persistent scratch takes a full chunk at once, so a frame with more
+    // detections than the last one does not allocate.
     MaskDecodeScratch  local;
     MaskDecodeScratch& buf = scratch ? *scratch : local;
-    buf.reserve(logit_bytes, idx_bytes, mask_bytes);
+    const std::size_t chunk = scratch ? kMaskChunk : std::min(kMaskChunk, num_dets);
+    buf.reserve(logit_bytes, chunk * sizeof(std::int32_t), chunk * mask_plane);
 
-    const HostPtr& h_logits = buf.h_logits;
-    const HostPtr& h_idx    = buf.h_idx;
-    const HostPtr& h_masks  = buf.h_masks;
-    const DevPtr&  d_logits = buf.d_logits;
-    const DevPtr&  d_idx    = buf.d_idx;
-    const DevPtr&  d_masks  = buf.d_masks;
-
-    std::memcpy(h_logits.get(), h_masks_logits, logit_bytes);
-    auto* h_idx_i32 = static_cast<std::int32_t*>(h_idx.get());
-    for (int i = 0; i < num_dets; ++i) {
-        h_idx_i32[i] = static_cast<std::int32_t>(query_indices[static_cast<std::size_t>(i)]);
-    }
-
-    RFDETR_CUDA_CHECK(cudaMemcpyAsync(d_logits.get(), h_logits.get(), logit_bytes,
-                                       cudaMemcpyHostToDevice, stream));
-    RFDETR_CUDA_CHECK(cudaMemcpyAsync(d_idx.get(), h_idx.get(), idx_bytes,
+    std::memcpy(buf.h_logits.get(), h_masks_logits, logit_bytes);
+    RFDETR_CUDA_CHECK(cudaMemcpyAsync(buf.d_logits.get(), buf.h_logits.get(), logit_bytes,
                                        cudaMemcpyHostToDevice, stream));
 
+    auto* h_idx_i32 = static_cast<std::int32_t*>(buf.h_idx.get());
+    const auto* src = static_cast<const std::uint8_t*>(buf.h_masks.get());
     constexpr int TX = 16, TY = 16;
     const dim3 block(TX, TY, 1);
-    const dim3 grid((imgW + TX - 1) / TX,
-                    (imgH + TY - 1) / TY,
-                    static_cast<unsigned>(num_dets));
-    maskDecodeKernel<<<grid, block, 0, stream>>>(
-        static_cast<const float*>(d_logits.get()),
-        static_cast<const std::int32_t*>(d_idx.get()),
-        mH, mW, imgH, imgW,
-        static_cast<std::uint8_t*>(d_masks.get()));
-    RFDETR_CUDA_CHECK(cudaGetLastError());
 
-    RFDETR_CUDA_CHECK(cudaMemcpyAsync(h_masks.get(), d_masks.get(), mask_bytes,
-                                       cudaMemcpyDeviceToHost, stream));
-    RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t first = 0; first < num_dets; first += chunk) {
+        const std::size_t n = std::min(chunk, num_dets - first);
+        // The previous chunk's stream synchronise has retired every copy out
+        // of h_idx and h_masks, so both are free to reuse here.
+        for (std::size_t i = 0; i < n; ++i) {
+            h_idx_i32[i] = static_cast<std::int32_t>(query_indices[first + i]);
+        }
+        RFDETR_CUDA_CHECK(cudaMemcpyAsync(buf.d_idx.get(), buf.h_idx.get(),
+                                           n * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, stream));
 
-    // Package into cv::Mat per detection (clone from pinned buffer).
-    const auto* src = static_cast<const std::uint8_t*>(h_masks.get());
-    for (int i = 0; i < num_dets; ++i) {
-        if (query_indices[static_cast<std::size_t>(i)] < 0) continue;
-        cv::Mat m(imgH, imgW, CV_8UC1);
-        std::memcpy(m.data, src + static_cast<std::size_t>(i) * mask_plane, mask_plane);
-        detections[static_cast<std::size_t>(i)].mask = std::move(m);
+        const dim3 grid((imgW + TX - 1) / TX,
+                        (imgH + TY - 1) / TY,
+                        static_cast<unsigned>(n));
+        maskDecodeKernel<<<grid, block, 0, stream>>>(
+            static_cast<const float*>(buf.d_logits.get()),
+            static_cast<const std::int32_t*>(buf.d_idx.get()),
+            mH, mW, imgH, imgW,
+            static_cast<std::uint8_t*>(buf.d_masks.get()));
+        RFDETR_CUDA_CHECK(cudaGetLastError());
+
+        RFDETR_CUDA_CHECK(cudaMemcpyAsync(buf.h_masks.get(), buf.d_masks.get(), n * mask_plane,
+                                           cudaMemcpyDeviceToHost, stream));
+        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Package into cv::Mat per detection (clone from pinned buffer).
+        for (std::size_t i = 0; i < n; ++i) {
+            if (query_indices[first + i] < 0) continue;
+            cv::Mat m(imgH, imgW, CV_8UC1);
+            std::memcpy(m.data, src + i * mask_plane, mask_plane);
+            detections[first + i].mask = std::move(m);
+        }
     }
 }
 

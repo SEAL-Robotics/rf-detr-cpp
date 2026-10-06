@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,19 +34,49 @@ struct BindingInfo {
     std::size_t bytes{0};     // element_count * sizeof(dtype)
 };
 
-// Owns a TRT runtime, engine, execution context, per-binding device + pinned-host
-// buffers, and a CUDA stream. Does sync inference (H2D -> enqueueV3 -> D2H + sync).
+namespace detail {
+
+// The deserialised half of a session: logger, runtime and engine. Shared by
+// every TrtSession built from it, so N sessions hold the weights once.
+// Member order is load-bearing: the engine must die before the runtime that
+// deserialised it, and the runtime before the logger it points at.
+struct EngineHandle {
+    EngineHandle(const std::filesystem::path& engine_path,
+                 nvinfer1::ILogger::Severity log_severity);
+
+    // Contexts are created from several threads' sessions; TensorRT does not
+    // promise createExecutionContext() is safe to race on one engine.
+    [[nodiscard]] std::unique_ptr<nvinfer1::IExecutionContext> create_context();
+
+    std::filesystem::path                  path;
+    TrtLogger                              logger;
+    std::unique_ptr<nvinfer1::IRuntime>    runtime;
+    std::unique_ptr<nvinfer1::ICudaEngine> engine;
+
+   private:
+    std::mutex context_mutex_;
+};
+
+}  // namespace detail
+
+// One execution context on a (possibly shared) engine, with its own
+// per-binding device + pinned-host buffers and CUDA stream. Sessions on the same
+// engine are independent and may run concurrently on different threads; one
+// session is single-threaded. Does sync inference (H2D -> enqueueV3 -> D2H + sync).
 class TrtSession {
    public:
+    // Deserialises a private engine.
     explicit TrtSession(const std::filesystem::path& engine_path,
                         nvinfer1::ILogger::Severity log_severity =
                             nvinfer1::ILogger::Severity::kWARNING);
+    // New context on an already-deserialised engine.
+    explicit TrtSession(std::shared_ptr<detail::EngineHandle> engine);
     ~TrtSession();
 
     TrtSession(const TrtSession&) = delete;
     TrtSession& operator=(const TrtSession&) = delete;
-    TrtSession(TrtSession&&) noexcept = default;
-    TrtSession& operator=(TrtSession&&) noexcept = default;
+    TrtSession(TrtSession&& other) noexcept = default;
+    TrtSession& operator=(TrtSession&& other) noexcept;
 
     const std::vector<BindingInfo>& bindings()        const noexcept { return bindings_; }
     const std::vector<int>&         input_indices()   const noexcept { return input_indices_; }
@@ -79,7 +110,7 @@ class TrtSession {
     void*       device_buffer(std::string_view name);
     const void* device_buffer(std::string_view name) const;
 
-    cudaStream_t stream() const noexcept { return stream_; }
+    cudaStream_t stream() const noexcept { return stream_.get(); }
 
     // Internal use — CUDA Graph capture.
     nvinfer1::IExecutionContext* context() const noexcept { return context_.get(); }
@@ -90,17 +121,15 @@ class TrtSession {
     static const char* dtype_name(nvinfer1::DataType d) noexcept;
 
    private:
-    void load_engine_(const std::filesystem::path& path);
     void parse_bindings_();
     void allocate_buffers_();
     void free_buffers_() noexcept;
+    void release_() noexcept;
     void update_binding_shape_(int idx, const nvinfer1::Dims& dims);
     void bind_address_(int idx);
 
-    TrtLogger                                       logger_;
-    std::unique_ptr<nvinfer1::IRuntime>             runtime_;
-    std::unique_ptr<nvinfer1::ICudaEngine>          engine_;
-    std::unique_ptr<nvinfer1::IExecutionContext>    context_;
+    std::shared_ptr<detail::EngineHandle>        engine_;
+    std::unique_ptr<nvinfer1::IExecutionContext> context_;
 
     std::vector<BindingInfo> bindings_;
     std::vector<DevPtr>      device_buffers_;    // RAII cudaMalloc, parallel to bindings_
@@ -109,7 +138,7 @@ class TrtSession {
     std::vector<int>         input_indices_;
     std::vector<int>         output_indices_;
 
-    cudaStream_t stream_{nullptr};
+    StreamPtr stream_;
 };
 
 }  // namespace rfdetr

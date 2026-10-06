@@ -1,5 +1,7 @@
 #include "internal/trt_session.hpp"
 
+#include "rfdetr/core/shared_engine.hpp"
+
 #include "internal/cuda_check.hpp"
 #include "internal/cuda_raii.hpp"
 
@@ -30,52 +32,14 @@ std::vector<char> read_file(const std::filesystem::path& path) {
 
 }  // namespace
 
-TrtSession::TrtSession(const std::filesystem::path& engine_path,
-                       nvinfer1::ILogger::Severity log_severity)
-    : logger_(log_severity) {
-    load_engine_(engine_path);
-    parse_bindings_();
-    // Non-blocking flag: defensive hygiene. Avoids implicit sync with the
-    // legacy NULL stream (stream 0) if any external library (cuBLAS without
-    // cublasSetStream, cv::cuda defaults, TRT plugins) happens to enqueue
-    // there. No measurable speedup in our pipeline; cosmetic correctness.
-    RFDETR_CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
-    allocate_buffers_();
-    for (std::size_t i = 0; i < bindings_.size(); ++i) {
-        bind_address_(static_cast<int>(i));
-    }
-}
+namespace detail {
 
-TrtSession::~TrtSession() {
-    // Destruction order matters when a CUDA context is still alive:
-    //   1) Drain any pending stream work (avoids "context is destroyed" errors
-    //      from in-flight async copies).
-    //   2) Free device + pinned host buffers BEFORE the engine/runtime — the
-    //      pinned allocator is tied to the CUDA context.
-    //   3) Destroy execution context, engine, runtime in that order. The
-    //      member declaration order in the header puts them runtime, engine,
-    //      context — and ~unique_ptr runs in reverse, so the implicit
-    //      destruction order is correct (context → engine → runtime). We
-    //      reset() explicitly here to make the order intent obvious and to
-    //      decouple it from any future field reordering.
-    //   4) Destroy the stream last.
-    if (stream_) {
-        cudaStreamSynchronize(stream_);
-    }
-    free_buffers_();
-    context_.reset();
-    engine_.reset();
-    runtime_.reset();
-    if (stream_) {
-        cudaStreamDestroy(stream_);
-        stream_ = nullptr;
-    }
-}
-
-void TrtSession::load_engine_(const std::filesystem::path& path) {
-    const auto blob = read_file(path);
-    runtime_.reset(nvinfer1::createInferRuntime(logger_));
-    if (!runtime_) throw std::runtime_error("rfdetr: createInferRuntime failed");
+EngineHandle::EngineHandle(const std::filesystem::path& engine_path,
+                           nvinfer1::ILogger::Severity log_severity)
+    : path(engine_path), logger(log_severity) {
+    const auto blob = read_file(engine_path);
+    runtime.reset(nvinfer1::createInferRuntime(logger));
+    if (!runtime) throw std::runtime_error("rfdetr: createInferRuntime failed");
 
     // Warn when the runtime TRT version differs from the compile-time headers.
     // Engines are not portable across TRT major/minor versions — rebuild after
@@ -91,25 +55,92 @@ void TrtSession::load_engine_(const std::filesystem::path& path) {
                 " != compile-time headers " + std::to_string(hdr_major) + "." +
                 std::to_string(hdr_minor) +
                 " — engine may fail to deserialize; rebuild with rfdetr_build";
-            logger_.log(nvinfer1::ILogger::Severity::kWARNING, msg.c_str());
+            logger.log(nvinfer1::ILogger::Severity::kWARNING, msg.c_str());
         }
     }
 
-    engine_.reset(runtime_->deserializeCudaEngine(blob.data(), blob.size()));
-    if (!engine_) throw std::runtime_error("rfdetr: deserializeCudaEngine failed");
-    context_.reset(engine_->createExecutionContext());
-    if (!context_) throw std::runtime_error("rfdetr: createExecutionContext failed");
+    engine.reset(runtime->deserializeCudaEngine(blob.data(), blob.size()));
+    if (!engine) throw std::runtime_error("rfdetr: deserializeCudaEngine failed");
+}
+
+std::unique_ptr<nvinfer1::IExecutionContext> EngineHandle::create_context() {
+    std::lock_guard<std::mutex> lock(context_mutex_);
+    std::unique_ptr<nvinfer1::IExecutionContext> ctx(engine->createExecutionContext());
+    if (!ctx) throw std::runtime_error("rfdetr: createExecutionContext failed");
+    return ctx;
+}
+
+}  // namespace detail
+
+TrtSession::TrtSession(const std::filesystem::path& engine_path,
+                       nvinfer1::ILogger::Severity log_severity)
+    : TrtSession(std::make_shared<detail::EngineHandle>(engine_path, log_severity)) {}
+
+TrtSession::TrtSession(std::shared_ptr<detail::EngineHandle> engine) : engine_(std::move(engine)) {
+    if (!engine_ || !engine_->engine) {
+        throw std::runtime_error("rfdetr: TrtSession needs a loaded engine");
+    }
+    context_ = engine_->create_context();
+    parse_bindings_();
+    // Non-blocking flag: defensive hygiene. Avoids implicit sync with the
+    // legacy NULL stream (stream 0) if any external library (cuBLAS without
+    // cublasSetStream, cv::cuda defaults, TRT plugins) happens to enqueue
+    // there. It also keeps sessions on one engine from serialising through
+    // stream 0.
+    cudaStream_t stream = nullptr;
+    RFDETR_CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    stream_.reset(stream);
+    allocate_buffers_();
+    for (std::size_t i = 0; i < bindings_.size(); ++i) {
+        bind_address_(static_cast<int>(i));
+    }
+}
+
+TrtSession::~TrtSession() { release_(); }
+
+TrtSession& TrtSession::operator=(TrtSession&& other) noexcept {
+    if (this != &other) {
+        release_();
+        engine_          = std::move(other.engine_);
+        context_         = std::move(other.context_);
+        bindings_        = std::move(other.bindings_);
+        device_buffers_  = std::move(other.device_buffers_);
+        host_buffers_    = std::move(other.host_buffers_);
+        buffer_capacity_ = std::move(other.buffer_capacity_);
+        input_indices_   = std::move(other.input_indices_);
+        output_indices_  = std::move(other.output_indices_);
+        stream_          = std::move(other.stream_);
+    }
+    return *this;
+}
+
+void TrtSession::release_() noexcept {
+    // Order matters while the CUDA context is alive, and a moved-from session
+    // (all members empty) must pass through as a no-op:
+    //   1) Drain pending stream work, so no async copy targets freed memory.
+    //   2) Free device + pinned host buffers before the engine — the pinned
+    //      allocator is tied to the CUDA context.
+    //   3) Context before engine; the engine (and its runtime) go only when
+    //      this was the last session holding them.
+    //   4) Stream last.
+    if (stream_) {
+        cudaStreamSynchronize(stream_.get());
+    }
+    free_buffers_();
+    context_.reset();
+    engine_.reset();
+    stream_.reset();
 }
 
 void TrtSession::parse_bindings_() {
-    const int n = engine_->getNbIOTensors();
+    const int n = engine_->engine->getNbIOTensors();
     bindings_.reserve(n);
     for (int i = 0; i < n; ++i) {
-        const char* name = engine_->getIOTensorName(i);
+        const char* name = engine_->engine->getIOTensorName(i);
         BindingInfo b;
         b.name = name;
-        b.dtype = engine_->getTensorDataType(name);
-        b.is_input = engine_->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
+        b.dtype = engine_->engine->getTensorDataType(name);
+        b.is_input = engine_->engine->getTensorIOMode(name) == nvinfer1::TensorIOMode::kINPUT;
         // Use context shape: for static engines this is fully resolved at this point.
         // For dynamic-shape inputs, dims may contain -1 until set_input_shape is called.
         b.shape = context_->getTensorShape(name);
@@ -244,14 +275,14 @@ void TrtSession::set_input(std::string_view name, const void* host_data, std::si
     }
     std::memcpy(host_buffers_[idx].get(), host_data, bytes);
     RFDETR_CUDA_CHECK(cudaMemcpyAsync(device_buffers_[idx].get(), host_buffers_[idx].get(), bytes,
-                                       cudaMemcpyHostToDevice, stream_));
+                                       cudaMemcpyHostToDevice, stream_.get()));
 }
 
 void TrtSession::infer() {
-    if (!context_->enqueueV3(stream_)) {
+    if (!context_->enqueueV3(stream_.get())) {
         throw std::runtime_error("rfdetr: enqueueV3 failed");
     }
-    RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_));
+    RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
 }
 
 void* TrtSession::device_buffer(std::string_view name) {
@@ -286,8 +317,8 @@ void TrtSession::get_output(std::string_view name, void* host_data, std::size_t 
         throw std::runtime_error(os.str());
     }
     RFDETR_CUDA_CHECK(cudaMemcpyAsync(host_buffers_[idx].get(), device_buffers_[idx].get(), bytes,
-                                       cudaMemcpyDeviceToHost, stream_));
-    RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                                       cudaMemcpyDeviceToHost, stream_.get()));
+    RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
     std::memcpy(host_data, host_buffers_[idx].get(), bytes);
 }
 
@@ -307,14 +338,14 @@ void TrtSession::get_output_f32(std::string_view name, float* host_float32,
     if (b.dtype == nvinfer1::DataType::kFLOAT) {
         // Native FP32 — use the normal path.
         RFDETR_CUDA_CHECK(cudaMemcpyAsync(host_buffers_[idx].get(), device_buffers_[idx].get(),
-                                           b.bytes, cudaMemcpyDeviceToHost, stream_));
-        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                                           b.bytes, cudaMemcpyDeviceToHost, stream_.get()));
+        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
         std::memcpy(host_float32, host_buffers_[idx].get(), b.bytes);
     } else if (b.dtype == nvinfer1::DataType::kHALF) {
         // FP16 — copy raw bytes then convert on CPU.
         RFDETR_CUDA_CHECK(cudaMemcpyAsync(host_buffers_[idx].get(), device_buffers_[idx].get(),
-                                           b.bytes, cudaMemcpyDeviceToHost, stream_));
-        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                                           b.bytes, cudaMemcpyDeviceToHost, stream_.get()));
+        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
         // Portable IEEE 754 fp16->fp32 conversion.
         const auto* src = static_cast<const std::uint16_t*>(host_buffers_[idx].get());
         for (std::size_t i = 0; i < element_count; ++i) {
@@ -342,8 +373,8 @@ void TrtSession::get_output_f32(std::string_view name, float* host_float32,
     } else if (b.dtype == nvinfer1::DataType::kINT8) {
         // INT8 output — dequantize with fixed scale 1/128.
         RFDETR_CUDA_CHECK(cudaMemcpyAsync(host_buffers_[idx].get(), device_buffers_[idx].get(),
-                                           b.bytes, cudaMemcpyDeviceToHost, stream_));
-        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_));
+                                           b.bytes, cudaMemcpyDeviceToHost, stream_.get()));
+        RFDETR_CUDA_CHECK(cudaStreamSynchronize(stream_.get()));
         const auto* src = static_cast<const std::int8_t*>(host_buffers_[idx].get());
         for (std::size_t i = 0; i < element_count; ++i) {
             host_float32[i] = static_cast<float>(src[i]) * (1.0f / 128.0f);
@@ -393,5 +424,11 @@ const char* TrtSession::dtype_name(nvinfer1::DataType d) noexcept {
         default: return "?";
     }
 }
+
+SharedEngine::SharedEngine(const std::filesystem::path& engine_path)
+    : handle_(std::make_shared<detail::EngineHandle>(engine_path,
+                                                     nvinfer1::ILogger::Severity::kWARNING)) {}
+
+const std::filesystem::path& SharedEngine::path() const noexcept { return handle_->path; }
 
 }  // namespace rfdetr

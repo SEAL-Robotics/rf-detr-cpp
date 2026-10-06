@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rfdetr/core/shared_engine.hpp"
 #include "rfdetr/core/types.hpp"
 
 #include <opencv2/core.hpp>
@@ -21,7 +22,8 @@ struct DetectorOptions {
 // Public single-class detector API.  Hides all TRT/CUDA headers from users.
 // Wraps TrtSession + ImagePreprocessor + decode_detections in a PIMPL.
 //
-// Thread safety: not thread-safe.  Use one instance per thread.
+// Thread safety: not thread-safe.  Use one instance per thread; instances built
+// from one SharedEngine run concurrently without duplicating the weights.
 class RFDetrDetector {
    public:
     // Load engine + sidecar from `engine_path` (sidecar = `engine_path` + ".json").
@@ -30,6 +32,12 @@ class RFDetrDetector {
 
     // Load engine with an explicit sidecar path.
     RFDetrDetector(const std::filesystem::path& engine_path,
+                   const std::filesystem::path& meta_path,
+                   const DetectorOptions& opts = {});
+
+    // New execution context, stream and buffers on an engine other instances
+    // may share; see SharedEngine.
+    RFDetrDetector(const SharedEngine& engine,
                    const std::filesystem::path& meta_path,
                    const DetectorOptions& opts = {});
 

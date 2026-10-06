@@ -5,6 +5,7 @@
 
 #include "rfdetr/core/types.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <vector>
 
@@ -12,8 +13,9 @@ namespace rfdetr {
 
 // Reusable pinned-host + device staging for the mask decode. Page-locking the
 // full-frame mask buffer costs more than the decode itself at 1080p, so a
-// segmenter creates one of these at init and reuses it across frames. Buffers
-// grow to the high-water mark and are never shrunk.
+// segmenter creates one of these at init and reuses it across frames. Masks go
+// through it mask_decode_chunk() detections at a time, so its size follows the
+// frame resolution only; it is never shrunk.
 //
 // Opaque by design: the definition lives in mask_decode.cu so this header stays
 // includable from plain .cpp files.
@@ -25,6 +27,14 @@ struct MaskDecodeScratchDeleter {
 using MaskDecodeScratchPtr = std::unique_ptr<MaskDecodeScratch, MaskDecodeScratchDeleter>;
 
 [[nodiscard]] MaskDecodeScratchPtr make_mask_decode_scratch();
+
+// Pre-sizes the logit and index staging for every query of an engine with
+// `num_queries` queries and mH x mW mask logits, so a decode never allocates
+// them mid-inference (an allocation synchronises the whole device).
+[[nodiscard]] MaskDecodeScratchPtr make_mask_decode_scratch(int num_queries, int mH, int mW);
+
+// Detections decoded per pass; the mask staging holds this many planes.
+[[nodiscard]] std::size_t mask_decode_chunk() noexcept;
 
 // GPU bilinear upsample + threshold for RF-DETR segmentation masks.
 // Writes CV_8UC1 masks back into detections[i].mask.

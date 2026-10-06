@@ -4,6 +4,7 @@
 #include "rfdetr/core/engine_meta.hpp"
 #include "rfdetr/core/log.hpp"
 #include "rfdetr/core/postprocess.hpp"
+#include "rfdetr/core/shared_engine.hpp"
 #include "../internal/cuda_check.hpp"
 #include "../internal/cuda_preprocess.cuh"
 #include "../internal/mask_decode.cuh"
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace rfdetr {
@@ -41,17 +43,17 @@ struct RFDetrSegmenter::Impl {
     PostprocessParams pp;
     Timings           timings;
 
-    // Reused across frames — see MaskDecodeScratch.
-    MaskDecodeScratchPtr mask_scratch{make_mask_decode_scratch()};
+    // Reused across frames; pre-sized in the constructor — see MaskDecodeScratch.
+    MaskDecodeScratchPtr mask_scratch;
 
     bool            graph_captured{false};
     cudaGraph_t     graph{nullptr};
     cudaGraphExec_t graph_exec{nullptr};
 
-    Impl(const std::filesystem::path& engine_path,
+    Impl(TrtSession trt_session,
          const std::filesystem::path& meta_path,
          const SegmenterOptions& options)
-        : session(engine_path)
+        : session(std::move(trt_session))
     {
         opts = options;
 
@@ -128,6 +130,7 @@ struct RFDetrSegmenter::Impl {
 
         h_dets.resize(static_cast<std::size_t>(N) * 4);
         h_labels.resize(static_cast<std::size_t>(N) * static_cast<std::size_t>(C));
+        mask_scratch = make_mask_decode_scratch(N, mH, mW);
         h_masks.resize(static_cast<std::size_t>(N) *
                        static_cast<std::size_t>(mH) *
                        static_cast<std::size_t>(mW));
@@ -186,7 +189,7 @@ struct RFDetrSegmenter::Impl {
             session.get_output_f32(b_masks->name,  h_masks.data(),  h_masks.size());
         }
 
-        RFDETR_CUDA_CHECK(cudaStreamBeginCapture(session.stream(), cudaStreamCaptureModeGlobal));
+        RFDETR_CUDA_CHECK(cudaStreamBeginCapture(session.stream(), cudaStreamCaptureModeThreadLocal));
         bool ok = ctx->enqueueV3(session.stream());
         if (ok) {
             cudaMemcpyAsync(h_dets.data(), session.device_buffer(b_dets->name),
@@ -335,8 +338,13 @@ RFDetrSegmenter::RFDetrSegmenter(const std::filesystem::path& engine_path,
 void RFDetrSegmenter::init_(const std::filesystem::path& engine_path,
                              const std::filesystem::path& meta_path,
                              const SegmenterOptions& opts) {
-    impl_ = std::make_unique<Impl>(engine_path, meta_path, opts);
+    impl_ = std::make_unique<Impl>(TrtSession(engine_path), meta_path, opts);
 }
+
+RFDetrSegmenter::RFDetrSegmenter(const SharedEngine& engine,
+                                 const std::filesystem::path& meta_path,
+                                 const SegmenterOptions& opts)
+    : impl_(std::make_unique<Impl>(TrtSession(engine.handle()), meta_path, opts)) {}
 
 RFDetrSegmenter::~RFDetrSegmenter() = default;
 RFDetrSegmenter::RFDetrSegmenter(RFDetrSegmenter&&) noexcept = default;

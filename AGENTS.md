@@ -35,7 +35,7 @@ include/rfdetr/       Public headers (consumers #include these)
   c_api.h             C ABI for FFI bindings
 src/                  Implementation — mirrors include/ structure
   internal/           Implementation-only headers (never installed)
-    trt_session.hpp       TensorRT runtime/engine/context wrapper
+    trt_session.hpp       TensorRT engine handle + per-context session
     cuda_preprocess.cuh   CUDA preprocessing kernel declarations
     trt_logger.hpp        ILogger → rfdetr log channel adapter
     cuda_check.hpp        RFDETR_CUDA_CHECK / RFDETR_TRT_CHECK macros
@@ -97,11 +97,12 @@ CMake options: `RFDETR_BUILD_APPS`, `RFDETR_BUILD_EXAMPLES`, `RFDETR_BUILD_BENCH
 
 ## Memory & Resource Ownership
 
-- `RFDetrDetector` and `RFDetrSegmenter` each own a `TrtSession`, which owns the `IRuntime`, `ICudaEngine`, `IExecutionContext`, and `cudaStream_t`.
+- `RFDetrDetector` and `RFDetrSegmenter` each own a `TrtSession`, which owns its `IExecutionContext`, buffers and `cudaStream_t`, and shares a `detail::EngineHandle` (logger, `IRuntime`, `ICudaEngine`). A path constructor gets a private handle; the `SharedEngine` constructors share one, so N instances hold the weights once and still infer concurrently.
+- CUDA Graph capture uses `cudaStreamCaptureModeThreadLocal`: global mode would fail other threads' sessions that happen to allocate or synchronise mid-capture.
 - Device and pinned-host buffers in `TrtSession` are managed via `DevPtr` / `HostPtr` RAII wrappers (see `src/internal/cuda_raii.hpp`). Never call `cudaFree` / `cudaFreeHost` manually outside a deleter.
 - `ImagePreprocessor` device and staging buffers are also `DevPtr` / `HostPtr` — destructor is `= default`.
 - CUDA Graph captures (`cudaGraph_t`, `cudaGraphExec_t`) are owned by `Impl` structs and destroyed in `destroy_graph_()`.
-- GPU mask decode (`src/core/mask_decode.cu`) allocates its own per-call scratch buffers via RAII and frees them automatically before returning.
+- GPU mask decode (`src/core/mask_decode.cu`) stages through a per-segmenter `MaskDecodeScratch`: logits and indices are sized at construction, and masks are decoded `mask_decode_chunk()` detections at a time through a buffer sized by frame resolution alone, allocated on the first decode at a resolution. Never allocate inside a steady-state inference call: `cudaMalloc`/`cudaMallocHost` synchronise the device and stall every other instance's stream.
 - The C ABI in `src/c_api.cpp` wraps the C++ API — never throw exceptions across the boundary.
 
 ---

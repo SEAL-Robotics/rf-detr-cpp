@@ -4,6 +4,7 @@
 #include "rfdetr/core/engine_meta.hpp"
 #include "rfdetr/core/log.hpp"
 #include "rfdetr/core/postprocess.hpp"
+#include "rfdetr/core/shared_engine.hpp"
 #include "../internal/cuda_check.hpp"
 #include "../internal/cuda_preprocess.cuh"
 #include "../internal/meta_validate.hpp"
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <filesystem>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace rfdetr {
@@ -41,10 +43,10 @@ struct RFDetrDetector::Impl {
     cudaGraph_t     graph{nullptr};
     cudaGraphExec_t graph_exec{nullptr};
 
-    Impl(const std::filesystem::path& engine_path,
+    Impl(TrtSession trt_session,
          const std::filesystem::path& meta_path,
          const DetectorOptions& options)
-        : session(engine_path)
+        : session(std::move(trt_session))
     {
         opts = options;
 
@@ -163,7 +165,7 @@ struct RFDetrDetector::Impl {
             session.get_output_f32(b_labels->name, h_labels.data(), h_labels.size());
         }
 
-        RFDETR_CUDA_CHECK(cudaStreamBeginCapture(session.stream(), cudaStreamCaptureModeGlobal));
+        RFDETR_CUDA_CHECK(cudaStreamBeginCapture(session.stream(), cudaStreamCaptureModeThreadLocal));
         bool ok = ctx->enqueueV3(session.stream());
         if (ok) {
             cudaMemcpyAsync(h_dets.data(), session.device_buffer(b_dets->name),
@@ -310,8 +312,13 @@ RFDetrDetector::RFDetrDetector(const std::filesystem::path& engine_path,
 void RFDetrDetector::init_(const std::filesystem::path& engine_path,
                             const std::filesystem::path& meta_path,
                             const DetectorOptions& opts) {
-    impl_ = std::make_unique<Impl>(engine_path, meta_path, opts);
+    impl_ = std::make_unique<Impl>(TrtSession(engine_path), meta_path, opts);
 }
+
+RFDetrDetector::RFDetrDetector(const SharedEngine& engine,
+                               const std::filesystem::path& meta_path,
+                               const DetectorOptions& opts)
+    : impl_(std::make_unique<Impl>(TrtSession(engine.handle()), meta_path, opts)) {}
 
 RFDetrDetector::~RFDetrDetector() = default;
 RFDetrDetector::RFDetrDetector(RFDetrDetector&&) noexcept = default;

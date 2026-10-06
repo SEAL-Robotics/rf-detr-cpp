@@ -17,3 +17,21 @@ target_link_libraries(test_engine_meta PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(test_engine_meta PRIVATE cxx_std_17)
 
 add_test(NAME engine_meta COMMAND test_engine_meta)
+
+# test_shared_engine needs a real engine on a real GPU, so it exists only when
+# one is named: -DRFDETR_TEST_ENGINE=/path/to/model.engine (sidecar alongside).
+set(RFDETR_TEST_ENGINE "" CACHE FILEPATH "Engine for GPU tests (empty: GPU tests not built)")
+if(RFDETR_TEST_ENGINE)
+    add_executable(test_shared_engine test_shared_engine.cpp)
+    target_link_libraries(test_shared_engine PRIVATE rfdetr::rfdetr)
+    add_test(NAME shared_engine COMMAND test_shared_engine ${RFDETR_TEST_ENGINE})
+
+    # Needs the GPU but not the engine. Compiles the decode directly because
+    # its symbols are internal to librfdetr.
+    add_executable(test_mask_decode test_mask_decode.cpp ${PROJECT_SOURCE_DIR}/src/core/mask_decode.cu)
+    target_include_directories(test_mask_decode PRIVATE
+        ${PROJECT_SOURCE_DIR}/include ${PROJECT_SOURCE_DIR}/src)
+    target_link_libraries(test_mask_decode PRIVATE CUDA::cudart ${OpenCV_LIBS})
+    target_compile_features(test_mask_decode PRIVATE cxx_std_17)
+    add_test(NAME mask_decode COMMAND test_mask_decode)
+endif()

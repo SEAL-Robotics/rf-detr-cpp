@@ -1,5 +1,6 @@
 #pragma once
 
+#include "rfdetr/core/shared_engine.hpp"
 #include "rfdetr/core/types.hpp"
 
 #include <opencv2/core.hpp>
@@ -25,12 +26,21 @@ struct SegmenterOptions {
 //
 // Each returned Detection has its `.mask` filled: CV_8UC1, same size as the
 // input image, values 0 or 255.
+//
+// Thread safety: not thread-safe.  Use one instance per thread; instances built
+// from one SharedEngine run concurrently without duplicating the weights.
 class RFDetrSegmenter {
    public:
     explicit RFDetrSegmenter(const std::filesystem::path& engine_path,
                              const SegmenterOptions& opts = {});
 
     RFDetrSegmenter(const std::filesystem::path& engine_path,
+                    const std::filesystem::path& meta_path,
+                    const SegmenterOptions& opts = {});
+
+    // New execution context, stream and buffers on an engine other instances
+    // may share; see SharedEngine.
+    RFDetrSegmenter(const SharedEngine& engine,
                     const std::filesystem::path& meta_path,
                     const SegmenterOptions& opts = {});
 
