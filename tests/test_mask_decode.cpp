@@ -112,6 +112,16 @@ void decode_and_check(rfdetr::MaskDecodeScratch* scratch, cudaStream_t stream,
     CHECK(mismatches == 0);
 }
 
+// On an integrated GPU (Jetson) device memory is system memory, so
+// cudaMemGetInfo moves with every other process and cannot show this one
+// allocating.
+bool device_memory_is_measurable() {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaGetDeviceProperties(&prop, dev) == cudaSuccess && !prop.integrated;
+}
+
 std::size_t device_free() {
     std::size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -137,7 +147,11 @@ int main() {
         for (int count : {chunk - 1, chunk, chunk + 1, 2 * chunk + 3, kQueries, 1}) {
             decode_and_check(scratch.get(), stream, logits, count);
         }
-        CHECK(device_free() == warm);
+        if (device_memory_is_measurable()) {
+            CHECK(device_free() == warm);
+        } else {
+            std::printf("allocation check skipped: integrated GPU\n");
+        }
     }
 
     // The call-scoped fallback decodes the same masks.

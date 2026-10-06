@@ -132,6 +132,16 @@ std::size_t device_used() {
     return total_b - free_b;
 }
 
+// On an integrated GPU (Jetson) device memory is system memory, so
+// cudaMemGetInfo moves with every other process and cannot attribute a delta
+// to this one.
+bool device_memory_is_measurable() {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    return cudaGetDevice(&dev) == cudaSuccess &&
+           cudaGetDeviceProperties(&prop, dev) == cudaSuccess && !prop.integrated;
+}
+
 double mib(std::size_t b) { return static_cast<double>(b) / (1024.0 * 1024.0); }
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
@@ -151,34 +161,50 @@ int main(int argc, char** argv) {
     try {
         const rfdetr::EngineMeta meta = rfdetr::EngineMeta::from_json_file(meta_path);
         const bool masks = meta.has_masks;
-        const cv::Mat frame_a = synthetic_frame(3, meta.input_h);
-        const cv::Mat frame_b = synthetic_frame(4, meta.input_h);
-        cudaFree(nullptr);  // create the CUDA context before measuring anything
+        // The first two synthetic frames this engine finds pins in: which ones
+        // clear the threshold depends on the device's numerics, and an empty
+        // frame cannot show the two contexts answering for different inputs.
+        std::vector<cv::Mat> frames;
+        {
+            auto probe = make_private(masks, engine_path, meta_path);
+            for (int seed = 3; seed < 3 + 32 && frames.size() < 2; ++seed) {
+                cv::Mat img = synthetic_frame(seed, meta.input_h);
+                if (!probe->run(img).empty()) frames.push_back(std::move(img));
+            }
+        }
+        CHECK(frames.size() == 2);
+        if (frames.size() != 2) return 1;
+        const cv::Mat& frame_a = frames[0];
+        const cv::Mat& frame_b = frames[1];
 
-        // --- Device memory: two private engines vs one shared engine ----------
-        const std::size_t base = device_used();
-        std::size_t two_private = 0;
-        {
-            auto p1 = make_private(masks, engine_path, meta_path);
-            auto p2 = make_private(masks, engine_path, meta_path);
-            (void)p1->run(frame_a);
-            (void)p2->run(frame_a);
-            two_private = device_used() - base;
+        if (device_memory_is_measurable()) {
+            // --- Device memory: two private engines vs one shared engine ----------
+            const std::size_t base = device_used();
+            std::size_t two_private = 0;
+            {
+                auto p1 = make_private(masks, engine_path, meta_path);
+                auto p2 = make_private(masks, engine_path, meta_path);
+                (void)p1->run(frame_a);
+                (void)p2->run(frame_a);
+                two_private = device_used() - base;
+            }
+            std::size_t two_shared = 0;
+            {
+                const rfdetr::SharedEngine engine(engine_path);
+                auto s1 = make_shared(masks, engine, meta_path);
+                auto s2 = make_shared(masks, engine, meta_path);
+                (void)s1->run(frame_a);
+                (void)s2->run(frame_a);
+                two_shared = device_used() - base;
+            }
+            std::printf("device memory for two instances: private engines %.1f MiB, shared engine "
+                        "%.1f MiB (saves %.1f MiB)\n",
+                        mib(two_private), mib(two_shared),
+                        mib(two_private) - mib(two_shared));
+            CHECK(two_shared < two_private);
+        } else {
+            std::printf("device memory comparison skipped: integrated GPU\n");
         }
-        std::size_t two_shared = 0;
-        {
-            const rfdetr::SharedEngine engine(engine_path);
-            auto s1 = make_shared(masks, engine, meta_path);
-            auto s2 = make_shared(masks, engine, meta_path);
-            (void)s1->run(frame_a);
-            (void)s2->run(frame_a);
-            two_shared = device_used() - base;
-        }
-        std::printf("device memory for two instances: private engines %.1f MiB, shared engine "
-                    "%.1f MiB (saves %.1f MiB)\n",
-                    mib(two_private), mib(two_shared),
-                    mib(two_private) - mib(two_shared));
-        CHECK(two_shared < two_private);
 
         // --- Reference output from a private engine ---------------------------
         rfdetr::Detections ref_a;
