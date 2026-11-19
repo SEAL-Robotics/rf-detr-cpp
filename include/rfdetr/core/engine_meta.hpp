@@ -96,6 +96,13 @@ struct EngineMeta {
     // would then act on.
     std::optional<bool> input_monochrome;
 
+    // A model trained on both luma and colour frames states it here: both true,
+    // with input_monochrome false. Absent stays absent for the same reason as
+    // input_monochrome; a consumer that finds neither key reads only
+    // input_monochrome.
+    std::optional<bool> accepts_monochrome_input;
+    std::optional<bool> accepts_color_input;
+
     // RGB->luma coefficients the training-time export used; only meaningful
     // when input_monochrome is true. Default is BT.601, which is also what
     // OpenCV's COLOR_BGR2GRAY hardcodes -- so a consumer forced to convert

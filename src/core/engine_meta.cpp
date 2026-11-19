@@ -37,6 +37,12 @@ EngineMeta EngineMeta::from_json_file(const std::filesystem::path& path) {
     if (j.contains("input_monochrome") && j["input_monochrome"].is_boolean()) {
         m.input_monochrome = j["input_monochrome"].get<bool>();
     }
+    if (j.contains("accepts_monochrome_input") && j["accepts_monochrome_input"].is_boolean()) {
+        m.accepts_monochrome_input = j["accepts_monochrome_input"].get<bool>();
+    }
+    if (j.contains("accepts_color_input") && j["accepts_color_input"].is_boolean()) {
+        m.accepts_color_input = j["accepts_color_input"].get<bool>();
+    }
     if (j.contains("luma_weights") && j["luma_weights"].is_array() &&
         j["luma_weights"].size() == 3) {
         m.luma_weights = j["luma_weights"].get<std::array<float, 3>>();
@@ -139,6 +145,12 @@ void EngineMeta::to_json_file(const std::filesystem::path& path) const {
         if (*input_monochrome) {
             j["luma_weights"] = luma_weights;
         }
+    }
+    if (accepts_monochrome_input.has_value()) {
+        j["accepts_monochrome_input"] = *accepts_monochrome_input;
+    }
+    if (accepts_color_input.has_value()) {
+        j["accepts_color_input"] = *accepts_color_input;
     }
     // Likewise: an absent bg_class_index leaves the tasks on their C-1
     // derivation, whereas an invented one would be cross-checked against that

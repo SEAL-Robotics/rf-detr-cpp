@@ -98,6 +98,8 @@ rfdetr::EngineMeta fully_populated() {
                         "pin_lugged_slide"};
     m.num_pin_types    = 5;
     m.input_monochrome = true;
+    m.accepts_monochrome_input = true;
+    m.accepts_color_input      = true;
     m.luma_weights     = {0.25f, 0.5f, 0.25f};
     return m;
 }
@@ -132,6 +134,8 @@ void expect_equal(const rfdetr::EngineMeta& a, const rfdetr::EngineMeta& b) {
     CHECK(a.pin_type_names == b.pin_type_names);
     CHECK(a.num_pin_types == b.num_pin_types);
     CHECK(a.input_monochrome == b.input_monochrome);
+    CHECK(a.accepts_monochrome_input == b.accepts_monochrome_input);
+    CHECK(a.accepts_color_input == b.accepts_color_input);
     CHECK(a.luma_weights == b.luma_weights);
 }
 
